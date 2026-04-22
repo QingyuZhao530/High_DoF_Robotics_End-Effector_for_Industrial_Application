@@ -78,13 +78,13 @@ class NavExplore:
 
         # ── motion ────────────────────────────────────────────────────
         self.forward_speed    = float(rospy.get_param("~forward_speed",    0.08))
-        self.turn_speed       = float(rospy.get_param("~turn_speed",       0.60))
-        self.max_angular      = float(rospy.get_param("~max_angular",      0.60))
+        self.turn_speed       = float(rospy.get_param("~turn_speed",       0.45))
+        self.max_angular      = float(rospy.get_param("~max_angular",      0.35))
         self.kp_center        = float(rospy.get_param("~kp_center",        0.15))
         self.kp_heading       = float(rospy.get_param("~kp_heading",       0.10))
         self.side_error_db    = float(rospy.get_param("~side_error_deadband", 0.08))
         self.wall_clearance   = float(rospy.get_param("~wall_clearance",   0.35))
-        self.max_angular_rate = float(rospy.get_param("~max_angular_rate", 0.20))
+        self.max_angular_rate = float(rospy.get_param("~max_angular_rate", 0.12))
         self.control_rate     = float(rospy.get_param("~control_rate",     10.0))
 
         # ── distance thresholds ───────────────────────────────────────
@@ -128,12 +128,41 @@ class NavExplore:
 
         # ── [FIX-4] speed-angular coupling ────────────────────────────
         # 转弯角速度超过此阈值时，开始降低线速度
-        self.ang_speed_reduce_thresh = float(rospy.get_param("~ang_speed_reduce_thresh", 0.15))
+        self.ang_speed_reduce_thresh = float(rospy.get_param("~ang_speed_reduce_thresh", 0.05))
 
         # ── [FIX-10] curvature constraint (prevent wheel reversal) ────
         # K ≈ 轮距/2.  轮子反转条件: |ω| > v / K.
         # FOLLOW 状态下自动约束 angular ≤ speed / K.
         self.wheel_k = float(rospy.get_param("~wheel_k", 0.12))
+
+        # ── [FIX-11] max wheel speed + ratio (move_base style) ──────────────
+        # 左轮 wL = v − K·ω，右轮 wR = v + K·ω.
+        # max_wheel_speed: 外轮绝对速度上限，等比例缩小 (v, ω)。
+        # max_wheel_ratio: 快轮/慢轮速度比上限（防极端差速漂移）。
+        #   导出角速度限制: |ω| ≤ v*(R-1) / (K*(R+1)), R=max_wheel_ratio.
+        #   R=4 → ang_limit=0.6*v/K; R→∞ → v/K (退化为防反转).
+        self.max_wheel_speed = float(rospy.get_param("~max_wheel_speed", 0.08))
+        self.max_wheel_ratio = float(rospy.get_param("~max_wheel_ratio", 1.2))
+
+        # ── [FIX-13] per-wheel rate limiter ───────────────────────────────────
+        # 直接对每个轮子的输出速度做斜率约束（单位: m/s/帧）。
+        # 比对 v 和 ω 分别限幅更直接：两个方向的变化叠加仍受同一上限。
+        self.max_wheel_accel = float(rospy.get_param("~max_wheel_accel", 0.002))
+        self.last_wL = 0.0
+        self.last_wR = 0.0
+
+        # ── persistent wheel-split detection ───────────────────────────────
+        # 检测“一侧轮持续加速、另一侧轮持续减速”的漂移模式。
+        # 连续满足 split_detect_frames 帧后，立即刹停并进入 SEEK_PATH，
+        # 重新做方向与速度规划，避免差速持续累积导致车体横漂/偏航。
+        self.split_detect_frames = int(rospy.get_param("~split_detect_frames", 5))
+        self.split_delta_eps     = float(rospy.get_param("~split_delta_eps", 0.0015))
+        self.split_speed_floor   = float(rospy.get_param("~split_speed_floor", 0.006))
+        self.split_cooldown_secs = float(rospy.get_param("~split_cooldown_secs", 1.5))
+        self.split_persist_count = 0
+        self.split_last_sign     = 0   # +1: 左加右减, -1: 左减右加
+        self.split_last_trigger_time = -999.0
+        self.split_state_label   = "IDLE"
 
         # ── [FIX-7] wall recovery before move_base ────────────────────
         # 当 AGV 贴墙太近时，move_base 因起点在 costmap 膨胀区内而
@@ -146,16 +175,16 @@ class NavExplore:
         self.recovery_max_secs   = float(rospy.get_param("~recovery_max_secs",   5.0))
 
         # ── frontier / navigation ─────────────────────────────────────
-        self.min_frontier_size      = int(  rospy.get_param("~min_frontier_size",      10))
+        self.min_frontier_size      = int(  rospy.get_param("~min_frontier_size",      8))
         self.min_frontier_dist      = float(rospy.get_param("~min_frontier_dist",      0.3))
         self.failed_frontier_radius = float(rospy.get_param("~failed_frontier_radius", 0.8))
-        self.nav_goal_timeout       = float(rospy.get_param("~nav_goal_timeout",       30.0))
-        self.goal_timeout           = float(rospy.get_param("~goal_timeout",           120.0))
+        self.nav_goal_timeout       = float(rospy.get_param("~nav_goal_timeout",       80.0))
+        self.goal_timeout           = float(rospy.get_param("~goal_timeout",           80.0))
         self.min_explore_secs       = float(rospy.get_param("~min_explore_secs",       20.0))
 
         # ── global timeout + no-progress watchdog ─────────────────────
-        self.max_explore_secs       = float(rospy.get_param("~max_explore_secs",       200.0))
-        self.no_progress_timeout    = float(rospy.get_param("~no_progress_timeout",    45.0))
+        self.max_explore_secs       = float(rospy.get_param("~max_explore_secs",       100.0))
+        self.no_progress_timeout    = float(rospy.get_param("~no_progress_timeout",    30.0))
         self.no_progress_radius     = float(rospy.get_param("~no_progress_radius",     0.5))
 
         # ── runtime state ─────────────────────────────────────────────
@@ -326,6 +355,132 @@ class NavExplore:
 
     def _stop(self):
         self._pub(0.0, 0.0)
+        self.last_wL = 0.0
+        self.last_wR = 0.0
+
+    def _reset_speed_planner(self):
+        """Reset wheel / speed / smoothing state after an emergency pause."""
+        self.last_speed = 0.0
+        self.last_angular = 0.0
+        self.last_wL = 0.0
+        self.last_wR = 0.0
+        self.blocked_frames_count = 0
+        self._front_ema = None
+
+    def _handle_persistent_wheel_split(self, dist, wL, wR):
+        """
+        Detect persistent drift pattern:
+          one wheel keeps accelerating while the other keeps decelerating.
+        After N consecutive frames, force stop and re-enter SEEK_PATH so the
+        robot replans heading and speed control from zero.
+        Also expose per-frame split status in logs for debugging.
+        """
+        now = rospy.get_time()
+        if (now - self.split_last_trigger_time) < self.split_cooldown_secs:
+            cooldown_left = max(0.0, self.split_cooldown_secs - (now - self.split_last_trigger_time))
+            self.split_state_label = "COOLDOWN %.2fs" % cooldown_left
+            return False
+
+        dL = wL - self.last_wL
+        dR = wR - self.last_wR
+        eps = self.split_delta_eps
+
+        split_sign = 0
+        split_label = "IDLE"
+        if dL > eps and dR < -eps:
+            split_sign = +1   # 左加速，右减速
+            split_label = "LEFT_UP_RIGHT_DOWN"
+        elif dL < -eps and dR > eps:
+            split_sign = -1   # 左减速，右加速
+            split_label = "LEFT_DOWN_RIGHT_UP"
+
+        moving_enough = max(abs(wL), abs(wR)) >= self.split_speed_floor
+        unbalanced = abs(wL - wR) >= (2.0 * eps)
+
+        if split_sign != 0 and moving_enough and unbalanced:
+            if split_sign == self.split_last_sign:
+                self.split_persist_count += 1
+            else:
+                self.split_persist_count = 1
+                self.split_last_sign = split_sign
+            self.split_state_label = "%s %d/%d" % (
+                split_label, self.split_persist_count, self.split_detect_frames)
+            rospy.loginfo(
+                "split=%s count=%d/%d dL=%.4f dR=%.4f wL=%.3f wR=%.3f",
+                split_label, self.split_persist_count, self.split_detect_frames,
+                dL, dR, wL, wR)
+        else:
+            if split_sign == 0:
+                if not moving_enough:
+                    self.split_state_label = "IDLE low_speed"
+                elif not unbalanced:
+                    self.split_state_label = "IDLE balanced"
+                else:
+                    self.split_state_label = "IDLE"
+            else:
+                self.split_state_label = "%s rejected" % split_label
+            self.split_persist_count = 0
+            self.split_last_sign = 0
+            return False
+
+        if self.split_persist_count < self.split_detect_frames:
+            return False
+
+        left = dist["left"] if dist and dist.get("left") is not None else 0.0
+        right = dist["right"] if dist and dist.get("right") is not None else 0.0
+        prefer_left = (left >= right)
+
+        rospy.logwarn(
+            "nav_explore: persistent wheel split detected for %d frames "
+            "(mode=%s | wL=%.3f dL=%.4f | wR=%.3f dR=%.4f) -> stop and replan via SEEK_PATH",
+            self.split_persist_count, split_label, wL, dL, wR, dR)
+
+        self._stop()
+        rospy.sleep(0.15)
+        self._reset_speed_planner()
+        self.split_persist_count = 0
+        self.split_last_sign = 0
+        self.split_state_label = "TRIGGERED -> SEEK_PATH"
+        self.split_last_trigger_time = now
+        self._enter_seek_path(prefer_left)
+        return True
+
+    def _clamp_cmd(self, lin, ang):
+        """
+        Wheel-speed normalisation (move_base style), two-stage:
+
+        Stage 1 – proportional scaling:
+          wL = v − K·ω,  wR = v + K·ω.
+          If either wheel exceeds max_wheel_speed, scale (v, ω) together
+          so turning curvature is preserved but the faster wheel is capped.
+
+        Stage 2 – no-reversal clamp (restores FIX-10):
+          During forward motion (v > 0), limit |ω| ≤ v/K so neither wheel
+          runs backward.  This is the constraint that actually prevents
+          the differential drift at low speeds where Stage 1 never fires
+          (actual wheel speeds << max_wheel_speed).
+        """
+        K = self.wheel_k
+
+        # ── Stage 1: proportional max-speed scaling ───────────────────────
+        ws = max(abs(lin - K * ang), abs(lin + K * ang))
+        if ws > self.max_wheel_speed and ws > 1e-6:
+            scale = self.max_wheel_speed / ws
+            lin  *= scale
+            ang  *= scale
+
+        # ── Stage 2: wheel ratio limit (replaces simple no-reversal) ────────
+        # Limit wL/wR ≤ max_wheel_ratio, derived as |ω| ≤ v*(R-1)/(K*(R+1)).
+        # R=4 → limit = 0.6*v/K; at full speed this is looser than max_angular.
+        # Tighter than plain no-reversal (v/K) so wR stays meaningfully positive.
+        if lin > 1e-3:
+            R = self.max_wheel_ratio
+            ang_ratio_limit = lin * (R - 1.0) / (K * (R + 1.0))
+            ang = _clamp(ang, -ang_ratio_limit, ang_ratio_limit)
+
+        # ── Stage 3: absolute angular ceiling ─────────────────────────────
+        ang = _clamp(ang, -self.max_angular, self.max_angular)
+        return lin, ang
 
     # ─────────────────────────── map queries ─────────────────────────────
     def _has_unknown_ahead(self, yaw):
@@ -589,6 +744,8 @@ class NavExplore:
             self._pub(0.0, 0.0)
             self.last_speed   = 0.0
             self.last_angular = 0.0
+            self.last_wL = 0.0
+            self.last_wR = 0.0
             return True
         else:
             # 仅在 AGV 实际移动时清零 blocked 计数。
@@ -646,6 +803,21 @@ class NavExplore:
             target_speed = min(target_speed, self.forward_speed * 0.5)
 
         # ──────────────────────────────────────────────────────────────
+        # [FIX-12] BEND 模式下已进入阻塞距离时，强制线速度为 0。
+        #
+        # 根因：FIX-9 的 15% 速度下限在 front_smooth < front_block_dist
+        # 时仍然生效，导致 AGV 在 BEND 状态下以 0.012 m/s 继续向障碍物
+        # 前进（撞箱子 / 蹭箱子），同时低速+角速度触发 wL/wR 4:1 漂移。
+        #
+        # 修复：BEND 且已在阻塞距离内 → target_speed=0 → 原地旋转。
+        #   原地旋转时 lin=0，_clamp_cmd Stage2 不激活，角速度不受
+        #   轮速比约束 → 转弯更锐利，wL=-K*ω / wR=+K*ω 完全对称。
+        #   fn 一旦重新超过 front_block_dist，15% 下限自然恢复。
+        # ──────────────────────────────────────────────────────────────
+        if is_bend and front_smooth < self.front_block_dist:
+            target_speed = 0.0
+
+        # ──────────────────────────────────────────────────────────────
         # [FIX-4] 速度-角速度耦合：转弯越急，线速度越低。
         # 防止 AGV 在高角速度时同时高速前进（急转+加速）。
         # 当 |angular| > ang_speed_reduce_thresh 时，
@@ -672,17 +844,13 @@ class NavExplore:
         self.last_speed = speed
 
         # ──────────────────────────────────────────────────────────────
-        # [FIX-10] 曲率约束：防止轮子反转。
-        #
-        # 左轮 = v − K·ω，右轮 = v + K·ω
-        # |ω| > v/K 时一侧轮子反转 → 产生漂移。
-        # 仅在前进时约束；纯旋转(SEEK_PATH)和后退不受影响。
+        # [FIX-10/11] 归一化轮速：等比例限制 (v, ω) 使外轮不超过
+        # max_wheel_speed，同时防止轮子反转（原 FIX-10 的功能被
+        # _clamp_cmd 的等比例缩放完全覆盖，不再单独处理）。
         # ──────────────────────────────────────────────────────────────
-        if speed > 0.001:
-            max_ang_no_rev = speed / self.wheel_k
-            if abs(angular) > max_ang_no_rev:
-                angular = _clamp(angular, -max_ang_no_rev, max_ang_no_rev)
-                self.last_angular = angular
+        speed, angular = self._clamp_cmd(speed, angular)
+        self.last_angular = angular
+        self.last_speed   = speed   # 等比例缩放可能降低线速度
 
         # ──────────────────────────────────────────────────────────────
         # [FIX-8] 消除速度死区：如果速度被截为 0 但没有进入 SEEK_PATH，
@@ -702,13 +870,30 @@ class NavExplore:
                 self._enter_seek_path(l >= r)
                 return False
 
-        # ── publish + log with estimated wheel speeds ────────────────
-        K = self.wheel_k
-        wl = speed - K * angular   # left  wheels
-        wr = speed + K * angular   # right wheels
-        rospy.loginfo("cmd v=%.3f w=%.3f | wL=%.3f wR=%.3f", speed, angular, wl, wr)
+        # ──────────────────────────────────────────────────────────────
+        # [FIX-13] Per-wheel rate limiter.
+        # 对每个轮子的速度变化率直接限幅，避免 v 和 ω 叠加后单轮跳变过大。
+        # ──────────────────────────────────────────────────────────────
+        K  = self.wheel_k
+        da = self.max_wheel_accel
+        wL_t = speed - K * angular
+        wR_t = speed + K * angular
+        wL = _clamp(wL_t, self.last_wL - da, self.last_wL + da)
+        wR = _clamp(wR_t, self.last_wR - da, self.last_wR + da)
 
-        self._pub(speed, angular)
+        if self._handle_persistent_wheel_split(dist, wL, wR):
+            return False
+
+        self.last_wL = wL
+        self.last_wR = wR
+        # Recover (v, ω) from smoothed wheel speeds for publishing
+        speed_out   = (wL + wR) / 2.0
+        angular_out = (wR - wL) / (2.0 * K)
+        self.last_speed   = speed_out
+        self.last_angular = angular_out
+        rospy.loginfo("cmd v=%.3f w=%.3f | wL=%.3f wR=%.3f | split=%s",
+                      speed_out, angular_out, wL, wR, self.split_state_label)
+        self._pub(speed_out, angular_out)
         return True
 
     # ─────────────────────────── SEEK_PATH state ─────────────────────────
@@ -732,6 +917,10 @@ class NavExplore:
         self.seek_frontiers  = []
         self.last_angular    = 0.0
         self.last_speed      = 0.0
+        self.last_wL         = 0.0
+        self.last_wR         = 0.0
+        self.split_persist_count = 0
+        self.split_last_sign = 0
         self._frontier_cache_time = -999.0   # force fresh map read
         # Clear fallback heading from any previous SEEK_PATH cycle.
         if hasattr(self, '_seek_fallback_yaw'):
@@ -874,6 +1063,15 @@ class NavExplore:
         angular    = _clamp(target_ang,
                             self.last_angular - self.max_angular_rate * 3,
                             self.last_angular + self.max_angular_rate * 3)
+        _, angular = self._clamp_cmd(0.0, angular)   # cap wheel speed during spin
+        # [FIX-13] per-wheel rate limit during rotation (lin=0 → wL=-K*ω, wR=+K*ω)
+        K  = self.wheel_k
+        da = self.max_wheel_accel
+        wL = _clamp(-K * angular, self.last_wL - da, self.last_wL + da)
+        wR = _clamp(+K * angular, self.last_wR - da, self.last_wR + da)
+        self.last_wL = wL
+        self.last_wR = wR
+        angular = (wR - wL) / (2.0 * K)
         self.last_angular = angular
         self._pub(0.0, angular)
 

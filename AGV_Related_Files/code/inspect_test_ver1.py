@@ -255,4 +255,3 @@ if __name__ == "__main__":
         InspectPatrol().run()
     except rospy.ROSInterruptException:
         pass
-    

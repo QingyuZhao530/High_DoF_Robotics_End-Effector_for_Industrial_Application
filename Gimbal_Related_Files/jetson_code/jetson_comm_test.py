@@ -113,12 +113,12 @@ class CommTest:
                       (trans[0], trans[1], trans[2]))
                 self.tf_ok = True
                 return True
-            except (tf.LookupException, tf.ConnectivityException,
-                    tf.ExtrapolationException):
+            except Exception:
                 pass
             rospy.sleep(0.1)
 
         print("    [FAIL] TF map->base_footprint not available after 3 s.")
+        print("    Hint: run 'rostopic echo /tf' on Jetson to check if TF data flows.")
         return False
 
     # ─────────────────────── 4. Map subscription + save ────────────────

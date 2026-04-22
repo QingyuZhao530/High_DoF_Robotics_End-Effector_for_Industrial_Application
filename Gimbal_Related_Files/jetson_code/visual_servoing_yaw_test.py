@@ -3,7 +3,7 @@
 
 """
 Jetson single/dual-axis adaptive visual servoing and capture script (TensorRT edition)
-Runs TRT inference for Crack and Erosion; drives gimbal to centre target then captures up to 3 photos.
+Runs TRT inference for Crack and Erosion; drives gimbal to centre target then captures up to 3 photos
 """
 
 import serial

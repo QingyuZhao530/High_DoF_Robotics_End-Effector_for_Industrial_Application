@@ -4,7 +4,7 @@
 """
 Pitch-only test variant of visual_servoing_test.py
 Single STM32 connected -> assigned to PITCH motor (up/down tracking).
-All other logic identical to visual_servoing_test.py.
+All other logic identical to visual_servoing_test.py
 """
 
 import serial

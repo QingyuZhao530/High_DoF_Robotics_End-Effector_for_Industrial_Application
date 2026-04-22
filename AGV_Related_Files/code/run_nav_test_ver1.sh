@@ -78,7 +78,7 @@ sleep 5
 # ===== 5. 设置参数并启动 nav_test_ver1.py =====
 echo "[5/5] Starting nav_test_ver1.py..."
 rosparam set /nav_explore/forward_speed 0.08
-rosparam set /nav_explore/turn_speed 0.60
+rosparam set /nav_explore/turn_speed 0.45
 rosparam set /nav_explore/max_angular 0.35
 rosparam set /nav_explore/kp_center 0.15
 rosparam set /nav_explore/kp_heading 0.10
@@ -104,18 +104,25 @@ rosparam set /nav_explore/bend_steer_gain 0.40
 rosparam set /nav_explore/front_ema_alpha 0.35
 rosparam set /nav_explore/ang_speed_reduce_thresh 0.05
 rosparam set /nav_explore/wheel_k 0.12
+rosparam set /nav_explore/max_wheel_speed 0.08
+rosparam set /nav_explore/max_wheel_ratio 1.2
+rosparam set /nav_explore/max_wheel_accel 0.002
+rosparam set /nav_explore/split_detect_frames 5
+rosparam set /nav_explore/split_delta_eps 0.0015
+rosparam set /nav_explore/split_speed_floor 0.006
+rosparam set /nav_explore/split_cooldown_secs 1.5
 
 # ── 贴墙恢复参数 ────────────────────────────────────────────────────
 rosparam set /nav_explore/recovery_clearance 0.35
 rosparam set /nav_explore/recovery_back_speed 0.05
 rosparam set /nav_explore/recovery_max_secs 5.0
-rosparam set /nav_explore/min_frontier_size 10
+rosparam set /nav_explore/min_frontier_size 8
 rosparam set /nav_explore/min_frontier_dist 0.3
 rosparam set /nav_explore/failed_frontier_radius 0.8
-rosparam set /nav_explore/nav_goal_timeout 30.0
+rosparam set /nav_explore/nav_goal_timeout 80.0
 rosparam set /nav_explore/min_explore_secs 20.0
-rosparam set /nav_explore/goal_timeout 120.0
-rosparam set /nav_explore/max_explore_secs 150.0
+rosparam set /nav_explore/goal_timeout 80.0
+rosparam set /nav_explore/max_explore_secs 100.0
 rosparam set /nav_explore/no_progress_timeout 30.0
 rosparam set /nav_explore/no_progress_radius 0.5
 
@@ -149,12 +156,22 @@ do
     if [[ $key == "q" ]]; then
         echo ""
         echo "Stopping robot..."
-        # Kill nav node directly by PID (faster and more reliable than rosnode kill)
+
+        # 1. Send zero velocity at 10 Hz for 1.5 s BEFORE killing the nav node.
+        #    This ensures the base driver receives a stop command while ROS is
+        #    still fully running.  rostopic pub -1 (one-shot) is unreliable
+        #    because the base driver may not process a single message in time.
+        timeout 2 rostopic pub /cmd_vel geometry_msgs/Twist \
+            '{linear: {x: 0.0}, angular: {z: 0.0}}' -r 10 \
+            > /dev/null 2>&1 &
+        PUB_PID=$!
+        sleep 1.5
+
+        # 2. Kill the nav node now that wheels are stopped.
         kill $PID_NAV 2>/dev/null || true
-        sleep 0.5
-        # Send zero velocity
-        timeout 3 rostopic pub -1 /cmd_vel geometry_msgs/Twist '{linear: {x: 0.0}, angular: {z: 0.0}}' 2>/dev/null || true
-        sleep 1
+        sleep 0.3
+        kill $PUB_PID 2>/dev/null || true
+        sleep 0.2
         echo "Saving map..."
         MAP_DIR=~/myagv_ros/src/myagv_navigation/map
         MAP_NAME="${MAP_DIR}/map"
